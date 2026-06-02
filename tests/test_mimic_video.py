@@ -1,0 +1,306 @@
+import pytest
+param = pytest.mark.parametrize
+
+import torch
+
+@param('model_output_clean', (False, True))
+@param('train_time_rtc', (False, True))
+@param('action_stats_given', (False, True))
+@param('condition_tokens_given', (False, True))
+def test_mimic_video(
+    model_output_clean,
+    train_time_rtc,
+    action_stats_given,
+    condition_tokens_given,
+):
+    from mimic_video.mimic_video import MimicVideo
+
+    video_hiddens = torch.randn(2, 64, 77)
+    video_mask = torch.randint(0, 2, (2, 64)).bool()
+
+    action_mean_std = None
+    if action_stats_given:
+        action_mean_std = torch.ones((2, 20))
+
+    advantage_ids = task_ids = None
+    if condition_tokens_given:
+        advantage_ids = torch.randint(0, 2, (2,))
+        task_ids = torch.randint(0, 3, (2,))
+
+    mimic_video = MimicVideo(
+        512,
+        action_mean_std = action_mean_std,
+        dim_video_hidden = 77,
+        train_time_rtc = train_time_rtc,
+        train_time_rtc_max_delay = 4,
+        num_advantage_ids = 2,
+        num_task_ids = 3,
+        model_output_clean = model_output_clean
+    )
+
+    actions = torch.randn(2, 32, 20)
+
+    joint_state = torch.randn(2, 32)
+
+    forward_kwargs = dict(video_hiddens = video_hiddens, context_mask = video_mask, joint_state = joint_state, advantage_ids = advantage_ids, task_ids = task_ids)
+
+    loss = mimic_video(actions = actions, **forward_kwargs)
+
+    assert loss.numel() == 1
+
+    flow = mimic_video(actions = actions, **forward_kwargs, time = torch.tensor([0.5, 0.5]))
+
+    assert flow.shape == actions.shape
+
+@param('prev_action_chunk', (False, True))
+@param('cross_attend_multiple', (False, True))
+@param('num_video_viewpoints', (1, 2))
+def test_e2e(
+    prev_action_chunk,
+    cross_attend_multiple,
+    num_video_viewpoints
+):
+    from mimic_video.mimic_video import MimicVideo
+    from mimic_video.cosmos_predict import CosmosPredictWrapper
+
+    if cross_attend_multiple:
+        extract_layer = [19, 20]
+        extracted_video_layer_indices = [0, 1, 1] # first layer attends to 19, second and third to 20
+    else:
+        extract_layer = 19
+        extracted_video_layer_indices = None
+
+    video_wrapper = CosmosPredictWrapper(
+        extract_layer = extract_layer,
+        random_weights = True,
+        tiny = True,
+    )
+
+    model = MimicVideo(
+        512,
+        video_wrapper,
+        depth = 3,
+        extracted_video_layer_indices = extracted_video_layer_indices,
+        num_video_viewpoints = num_video_viewpoints
+    )
+
+    num_views = (num_video_viewpoints,) if num_video_viewpoints > 1 else ()
+    video = torch.rand(1, *num_views, 5, 3, 32, 32)
+
+    actions = torch.randn(1, 32, 20)
+
+    joint_state = torch.randn(1, 32)
+
+    loss = model(
+        video = video,
+        actions = actions,
+        joint_state = joint_state,
+        prompts = 'put the package on the conveyer belt'
+    )
+
+    loss.backward()
+
+    prefix_action_chunk = None
+    if prev_action_chunk:
+        prefix_action_chunk = torch.randn(1, 4, 20)
+
+    pred_actions = model.sample(
+        video = video,
+        joint_state = joint_state,
+        prompts = 'pass the butter',
+        prefix_action_chunk = prefix_action_chunk
+    )
+
+    assert pred_actions.shape == (1, 32, 20)
+
+def test_lora_e2e():
+    import os
+    import shutil
+    from torch.utils.data import Dataset
+    from mimic_video.mimic_video import MimicVideo
+    from mimic_video.cosmos_predict import CosmosPredictWrapper
+
+    class DummyRobotDataset(Dataset):
+        def __len__(self): return 1
+        def __getitem__(self, _):
+            return torch.rand(9, 3, 32, 32), torch.randint(0, 1000, (32,))
+
+    save_path = './cosmos-lora-test'
+    if os.path.exists(save_path):
+        shutil.rmtree(save_path)
+
+    # 1. setup video wrapper and finetune to get a lora
+
+    video_wrapper = CosmosPredictWrapper(
+        extract_layers = [1, 2],
+        random_weights = True,
+        tiny = True
+    )
+
+    video_wrapper.finetune(
+        DummyRobotDataset(),
+        save_path = save_path,
+        epochs = 1
+    )
+
+    # 2. instantiate new wrapper with the trained lora_path
+
+    lora_wrapper = CosmosPredictWrapper(
+        extract_layers = [1, 2],
+        random_weights = True,
+        tiny = True,
+        lora_path = save_path
+    )
+
+    # 3. mimic video integration
+
+    model = MimicVideo(
+        dim = 512,
+        video_predict_wrapper = lora_wrapper,
+        depth = 3,
+        extracted_video_layer_indices = [0, 1, 1]
+    )
+
+    # 4. dummy states and actions
+
+    video = torch.rand(1, 5, 3, 32, 32)
+    joint_state = torch.randn(1, 32)
+    actions = torch.randn(1, 32, 20)
+
+    # 5. training forward pass
+
+    loss = model(
+        prompts = 'a task',
+        video = video,
+        actions = actions,
+        joint_state = joint_state
+    )
+
+    loss.backward()
+    assert loss.numel() == 1
+
+    # 6. inference sampling
+
+    sampled_actions = model.sample(
+        prompts = 'the final task',
+        video = video,
+        joint_state = joint_state
+    )
+
+    assert sampled_actions.shape == (1, 32, 20)
+
+    # cleanup
+
+    if os.path.exists(save_path):
+        shutil.rmtree(save_path)
+
+@param('use_minto', (False, True))
+@param('expectile_tau', (0.1, 0.5))
+@param('n_step_returns', (False, True))
+def test_latent_steering(use_minto, expectile_tau, n_step_returns):
+    from mimic_video.mimic_video import MimicVideo
+    from mimic_video.cosmos_predict import CosmosPredictWrapper
+    from mimic_video.flow_steering import FlowSteering
+
+    video_wrapper = CosmosPredictWrapper(
+        extract_layer = 1,
+        random_weights = True,
+        tiny = True
+    )
+
+    # mimic video
+
+    model = MimicVideo(512, video_wrapper)
+
+    # wrap model with diffusion steering
+
+    model = FlowSteering(model, use_minto = use_minto, expectile_tau = expectile_tau)
+
+    # states
+
+    video = torch.rand(2, 5, 3, 32, 32) # 5 frames, 3 channels, 32 x 32
+
+    joint_state = torch.randn(2, 32)
+    rewards = torch.randn(2, 4) if n_step_returns else torch.randn(2)
+
+    # action
+
+    actions = torch.randn(2, 32, 20)
+    noise_latents = torch.randn(2, 32, 20)
+
+    # training
+
+    loss, (actor_loss, outer_critic_loss, inner_critic_loss) = model(
+        prompts = [
+            'put the package on the conveyer belt',
+            'pass the butter'
+        ],
+        actions = actions,
+        noise_latents = noise_latents,
+        video = video,
+        joint_state = joint_state,
+        next_video = video,
+        next_joint_state = joint_state,
+        rewards = rewards
+    )
+
+    loss.backward()
+
+    # ... after much training
+
+    actions, noise_latents = model.sample(
+        prompts = 'peel the orange',
+        video = video[:1],
+        joint_state = joint_state[:1]
+    )
+
+    assert actions.shape == (1, 32, 20)
+
+def test_state_autoencoder():
+    from mimic_video.mimic_video import MimicVideo, exists
+
+    dim_video_hidden = 77
+    seq_len = 64
+
+    autoencoder_kwargs = dict(
+        enc_depth = 2,
+        dec_depth = 2,
+        max_seq_len = seq_len,
+        dim_latent = 32
+    )
+
+    video_hiddens = torch.randn(2, seq_len, dim_video_hidden)
+    video_mask = torch.randint(0, 2, (2, seq_len)).bool()
+
+    mimic_video = MimicVideo(
+        512,
+        dim_video_hidden = dim_video_hidden,
+        state_autoencoder = autoencoder_kwargs
+    )
+
+    actions = torch.randn(2, 32, 20)
+    joint_state = torch.randn(2, 32)
+
+    forward_kwargs = dict(video_hiddens = video_hiddens, context_mask = video_mask, joint_state = joint_state)
+
+    loss = mimic_video(actions = actions, **forward_kwargs)
+    loss.backward()
+
+    assert loss.numel() == 1
+
+    state_tokens = mimic_video.get_state_tokens(video_hiddens)
+    assert state_tokens.shape == (2, 32)
+
+    # test return_rl_token during sample
+
+    sampled_actions, rl_token = mimic_video.sample(
+        steps = 2,
+        batch_size = 2,
+        joint_state = joint_state,
+        video_hiddens = video_hiddens,
+        return_rl_token = True,
+        disable_progress_bar = True
+    )
+
+    assert sampled_actions.shape == (2, 32, 20)
+    assert exists(rl_token)

@@ -1,0 +1,1152 @@
+from __future__ import annotations
+from functools import partial
+from collections import namedtuple
+
+import torch
+from torch import nn, cat, stack, is_tensor, tensor
+from torch.nn import Module, ModuleList, Linear, GRU
+
+import torch.nn.functional as F
+
+import einx
+from einops import einsum, rearrange, repeat, reduce
+from einops.layers.torch import Rearrange, Reduce
+
+from x_mlps_pytorch import create_mlp
+
+from x_transformers.continuous_autoencoder import ContinuousTransformerAutoencoder
+
+from tqdm import tqdm
+
+from torch_einops_utils import (
+    lens_to_mask,
+    pad_right_ndim_to,
+    align_dims_left,
+    pad_at_dim,
+    pack_with_inverse,
+    masked_mean,
+    tree_map_tensor
+)
+
+# ein notation
+
+# b - batch
+# h - heads
+# g - groups
+# n - sequence
+# i, j - sequence (source, target)
+# d - feature dimension
+
+# constants
+
+LinearNoBias = partial(Linear, bias = False)
+
+# functions
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
+
+def identity(t):
+    return t
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
+def logit_normal_sample(mu, sigma, batch_size, device = None):
+    return torch.sigmoid(mu + sigma * torch.randn(batch_size, device = device))
+
+# wrappers
+
+def eval_no_grad(fn):
+    def inner(*args, **kwargs):
+        with torch.no_grad():
+            fn.eval()
+            return fn(*args, **kwargs)
+
+    return inner
+
+# tensor function
+
+def cast_tensor(val, device = None):
+    return tensor(val, device = device) if not is_tensor(val) else val
+
+def max_neg_value(t):
+    return -torch.finfo(t.dtype).max
+
+def l2norm(t, eps = 1e-10):
+    return F.normalize(t, dim = -1, eps = eps)
+
+# token shift from Peng et al. of RWKV
+# cheap way to generate relative positions
+
+def shift_feature_dim(t):
+    x, x_shift = t.chunk(2, dim = -1)
+    x_shift = pad_at_dim(x_shift, (1, -1), dim = 1)
+    return cat((x, x_shift), dim = -1)
+
+# action normalization
+
+class Normalizer(Module):
+    def __init__(
+        self,
+        mean,
+        std,
+        eps = 1e-6
+    ):
+        super().__init__()
+        assert (std > 0.).all(), 'std must be positive'
+        self.eps = eps
+
+        self.register_buffer('mean', mean)
+        self.register_buffer('std', std)
+
+    def normalize(self, t):
+        mean, std = self.mean, self.std
+        return (t - mean) / std.clamp_min(self.eps)
+
+    def inverse_normalize(self, t):
+        mean, std = self.mean, self.std
+        return (t * std) + mean
+
+# time
+
+# they follow p0's research finding with the beta distribution
+# lets stick with 0 noise to 1 data instead of the reverse
+
+def default_sample_time_fn(time, s = 0.999):
+    return torch.sqrt(s - time)
+
+class RandomFourierEmbed(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.proj = nn.Sequential(
+            Rearrange('... -> ... 1'),
+            nn.Linear(1, dim)
+        )
+
+        self.proj.requires_grad_(False)
+
+    def forward(self, times):
+        rand_proj = self.proj(times)
+        return torch.cos(2 * torch.pi * rand_proj)
+
+# regular rmsnorm
+
+class RMSNorm(Module):
+    def __init__(
+        self,
+        dim,
+        **kwargs
+    ):
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, **kwargs)
+
+    def forward(
+        self,
+        tokens,
+        *args,
+        **kwargs
+    ):
+        normed = self.norm(tokens)
+        return normed, 1.
+
+# adaptive rmsnorm
+
+class AdaptiveRMSNorm(Module):
+    def __init__(
+        self,
+        dim,
+        dim_time_cond,
+        eps = 1e-6,
+        ada_ln_zero_bias = -5.
+    ):
+        super().__init__()
+        self.scale = dim ** 0.5
+        self.eps = eps
+
+        self.to_modulation = LinearNoBias(dim_time_cond, dim * 3)
+        self.split_modulation = Rearrange('... (three d) -> three ... d', three = 3)
+
+        nn.init.zeros_(self.to_modulation.weight)
+
+        self.ada_ln_zero_bias = ada_ln_zero_bias
+
+    def forward(
+        self,
+        tokens,
+        time_cond
+    ):
+        if time_cond.ndim == 2:
+            time_cond = rearrange(time_cond, 'b d -> b 1 d')
+
+        modulations = self.to_modulation(time_cond)
+
+        scale, shift, gate = self.split_modulation(modulations)
+
+        normed = l2norm(tokens, self.eps) * self.scale
+
+        adaptive_normed = normed * (scale + 1.) + shift
+
+        gate_with_bias = (gate + self.ada_ln_zero_bias).sigmoid()
+
+        return adaptive_normed, gate_with_bias
+
+# attention
+
+Cache = namedtuple('Cache', ['self_attn_kv', 'gru_hidden', 'seq_len', 'video_hiddens'])
+
+class Attention(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        dim_context = None,
+        dim_head = 64,
+        heads = 8,
+        kv_heads = 2,
+        attn_gate_value = True,
+        norm_context = False
+    ):
+        super().__init__()
+        dim_q_inner = dim_head * heads
+        dim_kv_inner = dim_head * kv_heads
+
+        self.has_attn_gate_value = attn_gate_value
+
+        dim_context = default(dim_context, dim)
+        self.context_norm = nn.RMSNorm(dim_context) if norm_context else nn.Identity()
+
+        self.scale = dim_head ** -0.5
+
+        self.to_queries = LinearNoBias(dim, dim_q_inner)
+        self.to_keys_values = LinearNoBias(dim_context, dim_kv_inner * 2)
+
+        if attn_gate_value:
+            self.attn_gate_value = nn.Sequential(LinearNoBias(dim, heads), Rearrange('b n (g h) -> b g h n 1', h = kv_heads))
+
+        self.to_out = LinearNoBias(dim_q_inner, dim)
+
+        assert divisible_by(heads, kv_heads)
+        groups = heads // kv_heads
+
+        self.split_q_heads = Rearrange('b n (g h d) -> b g h n d', g = groups, d = dim_head)
+        self.split_kv_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
+        self.merge_heads = Rearrange('b g h n d -> b n (g h d)')
+
+    def forward(
+        self,
+        tokens,
+        context = None,
+        context_mask = None,
+        kv = None,
+        return_kv = False
+    ):
+        context = default(context, tokens)
+        is_self_attn = context is tokens
+
+        queries = self.to_queries(tokens)
+        queries = self.split_q_heads(queries)
+
+        if exists(kv) and not is_self_attn:
+            keys, values = kv
+        else:
+            context = self.context_norm(context)
+            keys, values = self.to_keys_values(context).chunk(2, dim = -1)
+            keys, values = tuple(self.split_kv_heads(t) for t in (keys, values))
+
+        current_kv = stack((keys, values))
+
+        if exists(kv) and is_self_attn:
+            prev_keys, prev_values = kv
+            keys = cat((prev_keys, keys), dim = -2)
+            values = cat((prev_values, values), dim = -2)
+
+        queries = queries * self.scale
+
+        sim = einsum(queries, keys, 'b g h i d, b h j d -> b g h i j')
+
+        if exists(context_mask):
+            mask_value = max_neg_value(sim)
+            sim = einx.where('b j, b g h i j,', context_mask, sim, mask_value)
+
+        attn = sim.softmax(dim = -1)
+
+        out = einsum(attn, values, 'b g h i j, b h j d -> b g h i d')
+
+        # https://openreview.net/forum?id=1b7whO4SfY - should become standard practice
+
+        if self.has_attn_gate_value:
+            out = out * self.attn_gate_value(tokens).sigmoid()
+
+        out = self.merge_heads(out)
+
+        out = self.to_out(out)
+
+        if not return_kv:
+            return out
+
+        return out, current_kv
+
+# feedforward
+
+class SwiGLUFeedForward(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        expansion_factor = 4.,
+    ):
+        super().__init__()
+        dim_inner = int(dim * expansion_factor * 2 / 3)
+
+        self.proj_in = nn.Linear(dim, dim_inner * 2)
+        self.proj_out = nn.Linear(dim_inner, dim)
+
+    def forward(
+        self,
+        tokens
+    ):
+        hidden, gates = self.proj_in(tokens).chunk(2, dim = -1)
+
+        out = hidden * F.gelu(gates)
+
+        return self.proj_out(out)
+
+# attention residuals - https://arxiv.org/abs/2603.15031
+
+class AttentionPool(Module):
+    def __init__(
+        self,
+        dim,
+        dim_context = None,
+        heads = 8,
+        dim_head = 64
+    ):
+        super().__init__()
+        dim_context = default(dim_context, dim)
+        self.queries = nn.Parameter(torch.zeros(dim))
+
+        self.pooler = Attention(
+            dim = dim,
+            dim_context = dim_context,
+            heads = heads,
+            dim_head = dim_head,
+            norm_context = True,
+            attn_gate_value = False
+        )
+
+    def forward(self, context):
+        batch = context.shape[0]
+        queries = repeat(self.queries, 'd -> b 1 d', b = batch)
+        return self.pooler(queries, context = context).squeeze(1)
+
+class AttentionAggregatedResidual(Module):
+    def __init__(
+        self,
+        dim,
+        heads = 4,
+        dim_head = 64
+    ):
+        super().__init__()
+
+        self.attn_pool = AttentionPool(
+            dim = dim,
+            dim_context = dim,
+            heads = heads,
+            dim_head = dim_head,
+        )
+
+    def forward(
+        self,
+        layer_outputs: list[Tensor],
+    ):
+        assert len(layer_outputs) > 0
+
+        if len(layer_outputs) == 1:
+            return layer_outputs[0]
+
+        stacked = stack(layer_outputs, dim = 2)
+
+        packed, inverse_pack = pack_with_inverse(stacked, '* l d')
+
+        pooled = self.attn_pool(packed)
+
+        return inverse_pack(pooled, '* d')
+
+# rl related
+
+class Actor(Module):
+    def __init__(
+        self,
+        model: MimicVideo
+    ):
+        super().__init__()
+        self.model = model
+        self.action_queries = nn.Parameter(torch.randn(model.action_chunk_len, model.dim_action))
+
+    def forward(
+        self,
+        *args,
+        joint_state,
+        video = None,
+        **kwargs
+    ):
+        assert 'actions' not in kwargs, 'actions should not be passed into actor'
+
+        batch = joint_state.shape[0]
+
+        queries = repeat(self.action_queries, 'n d -> b n d', b = batch)
+
+        return self.model(
+            *args,
+            joint_state = joint_state,
+            video = video,
+            actions = queries,
+            **kwargs
+        )
+
+class Critic(Module):
+    def __init__(
+        self,
+        model: MimicVideo
+    ):
+        super().__init__()
+        self.model = model
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+# classes
+
+class MimicVideo(Module):
+    def __init__(
+        self,
+        dim,
+        video_predict_wrapper: Module | None = None,
+        *,
+        dim_video_hidden = None,
+        action_chunk_len = 32,
+        dim_action = 20,
+        dim_joint_state = 32,
+        proprio_mask_prob = 0.1,
+        depth = 8,
+        dim_head = 64,
+        heads = 8,
+        attention_residual_heads = 4,
+        attention_residual_dim_head = 64,
+        expansion_factor = 4.,
+        is_flow_model = True,
+        ada_ln_zero_bias = -5.,
+        dim_time_cond = None,
+        pred_head: Module | None = None,
+        sample_time_fn = None,
+        train_time_rtc = False,
+        train_time_rtc_max_delay = None,
+        action_mean_std: Tensor | None = None,
+        joint_mean_std: Tensor | None = None,
+        model_output_clean = True,  # https://arxiv.org/abs/2511.13720 - Kaiming He group paper
+        num_task_ids = 0,
+        num_advantage_ids = 0,
+        advantage_cfg_dropout = 0.25,
+        extracted_video_layer_indices: list[int] | None = None,
+        num_video_viewpoints = 1,
+        video_time_denoise_mu = 0.,
+        video_time_denoise_sigma = 1.,
+        state_autoencoder: Module | dict | None = None,
+        state_autoencoder_loss_weight = 1.,
+        state_autoencoder_video_layer_index: int | None = None,
+        eps = 1e-5
+    ):
+        init_kwargs = locals()
+        init_kwargs.pop('self')
+        init_kwargs.pop('__class__', None)
+        self._init_kwargs = init_kwargs
+
+        super().__init__()
+
+        self.depth = depth
+
+        # maybe video predict
+
+        self.video_predict_wrapper = video_predict_wrapper
+        self.num_video_viewpoints = num_video_viewpoints
+
+        # action related
+
+        self.action_chunk_len = action_chunk_len
+        self.dim_action = dim_action
+
+        self.action_shape = (action_chunk_len, dim_action)
+
+        self.action_normalizer = None
+
+        if exists(action_mean_std):
+            assert action_mean_std.shape == (2, dim_action), f'must be in shape of (2 action_dim)'
+            self.action_normalizer = Normalizer(*action_mean_std)
+
+        # joint dim
+
+        self.dim_joint_state = dim_joint_state
+
+        dim_video_hidden = default(dim_video_hidden, video_predict_wrapper.dim_latent if exists(video_predict_wrapper) else None)
+
+        assert exists(dim_video_hidden), f'`dim_video_hidden` must be set or `video_predict_wrapper` passed in with `dim_latent`'
+
+        self.dim_video_hidden = dim_video_hidden
+
+        self.view_emb = nn.Parameter(torch.randn(num_video_viewpoints, dim_video_hidden) * 1e-2) if num_video_viewpoints > 1 else None
+
+        self.joint_normalizer = None
+
+        if exists(joint_mean_std):
+            assert joint_mean_std == (2, dim_joint_state)
+            self.joint_normalizer = Normalizer(*joint_mean_std)
+
+        # flow related
+
+        self.sample_time_fn = default(sample_time_fn, default_sample_time_fn)
+
+        # embed
+
+        self.to_action_tokens = Linear(dim_action, dim)
+
+        # time related, but can be turned off
+
+        self.is_flow_model = is_flow_model
+
+        dim_time_cond = default(dim_time_cond, dim * 2)
+
+        self.to_fourier_embed = RandomFourierEmbed(dim) if is_flow_model else None # used by deepmind, its fine
+        self.to_time_cond = create_mlp(dim_in = dim * 2, dim = dim_time_cond, depth = 2, activation = nn.SiLU()) if is_flow_model else None
+
+        maybe_adaptive_rmsnorm_klass = partial(AdaptiveRMSNorm, dim_time_cond = dim_time_cond) if is_flow_model else RMSNorm
+
+        # joint token related
+
+        self.to_joint_state_token = Linear(dim_joint_state, dim)
+
+        self.proprio_mask_prob = proprio_mask_prob
+        self.has_proprio_masking = proprio_mask_prob > 0.
+
+        self.proprio_mask_token = nn.Parameter(torch.randn(dim))
+
+        # rnn
+
+        self.rnn = GRU(dim, dim, batch_first = True)
+
+        # transformer
+
+        layers = []
+
+        for _ in range(depth):
+
+            attn = Attention(dim = dim, dim_head = dim_head, heads = heads)
+            cross_attn = Attention(dim = dim, dim_head = dim_head, dim_context = dim_video_hidden, heads = heads, norm_context = True)
+            ff = SwiGLUFeedForward(dim = dim, expansion_factor = expansion_factor)
+
+            # norms
+
+            attn_adanorm = maybe_adaptive_rmsnorm_klass(dim = dim)
+            cross_attn_adanorm = maybe_adaptive_rmsnorm_klass(dim = dim)
+            ff_adanorm = maybe_adaptive_rmsnorm_klass(dim = dim)
+
+            # attention residuals
+
+            attn_residual = AttentionAggregatedResidual(dim = dim, heads = attention_residual_heads, dim_head = attention_residual_dim_head)
+            cross_attn_residual = AttentionAggregatedResidual(dim = dim, heads = attention_residual_heads, dim_head = attention_residual_dim_head)
+            ff_residual = AttentionAggregatedResidual(dim = dim, heads = attention_residual_heads, dim_head = attention_residual_dim_head)
+
+            # all layers
+
+            layers.append(ModuleList([
+                cross_attn_residual,
+                cross_attn_adanorm,
+                cross_attn,
+                attn_residual,
+                attn_adanorm,
+                attn,
+                ff_residual,
+                ff_adanorm,
+                ff
+            ]))
+
+        self.layers = ModuleList(layers)
+
+        self.final_attn_agg = AttentionAggregatedResidual(dim = dim, heads = attention_residual_heads, dim_head = attention_residual_dim_head)
+
+        # predictions
+
+        self.final_norm = nn.RMSNorm(dim)
+
+        if not exists(pred_head):
+            pred_head = LinearNoBias(dim, dim_action)
+
+        self.to_pred = pred_head
+
+        # inference related
+
+        # train time RTC related - https://arxiv.org/abs/2512.05964
+
+        self.train_time_rtc = train_time_rtc
+
+        assert not train_time_rtc or exists(train_time_rtc_max_delay)
+        self.train_time_rtc_max_delay = train_time_rtc_max_delay
+
+        # condition related
+
+        self.task_embed = nn.Embedding(num_task_ids, dim) if num_task_ids > 0 else None
+
+        self.advantage_embed = nn.Embedding(num_advantage_ids + 1, dim) if num_advantage_ids > 0 else None
+
+        assert advantage_cfg_dropout > 0.
+
+        self.advantage_cfg_dropout = advantage_cfg_dropout
+
+        # allow for researchers to explore beyond just one layer of pretrained
+        # we should also open up research into multiple pretrained models eventually
+
+        self.extracted_video_layer_indices = default(extracted_video_layer_indices, (0,) * depth)
+        assert len(self.extracted_video_layer_indices) == depth
+
+        # whether output to action transformer tower is flow or x0
+
+        self.model_output_clean = model_output_clean
+        self.eps = eps
+
+        # aux loss and device
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+        self.video_time_denoise_mu = video_time_denoise_mu
+        self.video_time_denoise_sigma = video_time_denoise_sigma
+
+        if isinstance(state_autoencoder, dict):
+            state_autoencoder = ContinuousTransformerAutoencoder(
+                dim = dim_video_hidden,
+                **state_autoencoder
+            )
+
+        self.state_autoencoder = state_autoencoder
+        self.state_autoencoder_loss_weight = state_autoencoder_loss_weight
+
+        self.state_autoencoder_video_layer_index = default(state_autoencoder_video_layer_index, self.extracted_video_layer_indices[depth // 3]) # https://arxiv.org/abs/2602.07050
+
+    def create_actor_from(self, **override_model_kwargs):
+        kwargs = self._init_kwargs.copy()
+
+        dim = kwargs['dim']
+        dim_action = kwargs.get('dim_action', self.dim_action)
+
+        pred_head = nn.Sequential(
+            LinearNoBias(dim, dim_action * 2),
+            Rearrange('b n (d c) -> b n d c', c = 2)
+        )
+
+        kwargs.update(
+            is_flow_model = False,
+            model_output_clean = False,
+            pred_head = pred_head,
+            **override_model_kwargs
+        )
+
+        actor_model = MimicVideo(**kwargs)
+        actor_model.load_state_dict(self.state_dict(), strict = False)
+        return Actor(actor_model)
+
+    def create_critic_from(self, **override_model_kwargs):
+        kwargs = self._init_kwargs.copy()
+
+        dim = kwargs['dim']
+
+        pred_head = nn.Sequential(
+            Reduce('b n d -> b d', 'mean'),
+            LinearNoBias(dim, 1),
+            Rearrange('b 1 -> b')
+        )
+
+        kwargs.update(
+            is_flow_model = False,
+            model_output_clean = False,
+            pred_head = pred_head,
+            **override_model_kwargs
+        )
+
+        critic_model = MimicVideo(**kwargs)
+        critic_model.load_state_dict(self.state_dict(), strict = False)
+        return Critic(critic_model)
+
+    # only action parameters
+
+    def action_parameters(self):
+        video_model_params = set(self.video_predict_wrapper.parameters()) if exists(self.video_predict_wrapper) else {}
+        return set(self.parameters()) - video_model_params
+
+    @property
+    def device(self):
+        return self.zero.device
+
+    @torch.no_grad()
+    def sample(
+        self,
+        steps = 16,
+        batch_size = 1,
+        prefix_action_chunk = None,
+        disable_progress_bar = False,
+        predict_num_future_latents = 1,
+        noise_latents = None,
+        return_rl_token = False,
+        **kwargs
+    ):
+        assert predict_num_future_latents > 0
+
+        self.eval()
+
+        inpainting = exists(prefix_action_chunk)
+
+        # times
+
+        times = torch.linspace(0., 1., steps + 1, device = self.device)[:-1]
+        delta = 1. / steps
+
+        # inpaint
+
+        if inpainting:
+            prefix_len = prefix_action_chunk.shape[1]
+            assert prefix_len < self.action_chunk_len
+
+            maybe_normed_prefix = prefix_action_chunk
+
+            if exists(self.action_normalizer):
+                maybe_normed_prefix = self.action_normalizer.normalize(prefix_action_chunk)
+
+            times = repeat(times, 'steps -> steps b n', b = batch_size, n = self.action_chunk_len).clone()
+            times[..., :prefix_len] = 1.
+
+        # noise
+
+        action_shape = (batch_size, *self.action_shape)
+
+        if not exists(noise_latents):
+            noise_latents = torch.randn(action_shape, device = self.device)
+
+        # denoised action starts as noise
+
+        denoised = noise_latents
+
+        cache = None
+
+        # denoise
+
+        for time in tqdm(times, disable = disable_progress_bar):
+
+            if inpainting:
+                denoised[:, :prefix_len] = maybe_normed_prefix
+
+            pred_flow, cache = self.forward(actions = denoised, time = time, cache = cache, predict_num_future_latents = predict_num_future_latents, return_cache = True, **kwargs)
+
+            denoised = denoised + delta * pred_flow
+
+        # handle action inverse norm
+
+        if exists(self.action_normalizer):
+            denoised = self.action_normalizer.inverse_normalize(denoised)
+
+        # final set, with unnormalized prefix, if inpainting
+
+        if inpainting:
+            denoised[:, :prefix_len] = prefix_action_chunk
+
+        if not return_rl_token:
+            return denoised
+
+        assert exists(self.state_autoencoder)
+
+        rl_token = self.get_state_tokens(cache.video_hiddens)
+
+        return denoised, rl_token
+
+    @torch.no_grad()
+    def get_state_tokens(self, video_hiddens):
+        assert exists(self.state_autoencoder)
+        self.eval()
+
+        if isinstance(video_hiddens, list):
+            video_hiddens = video_hiddens[self.state_autoencoder_video_layer_index]
+
+        return self.state_autoencoder.encode(video_hiddens)
+
+    def forward(
+        self,
+        *,
+        actions = None,                 # (b na d)
+        joint_state,                    # (b)
+        task_ids = None,                # (b)
+        advantage_ids = None,           # (b)
+        dropout_advantage_ids = False,
+        video = None,                   # (b t c h w)
+        video_hiddens = None,           # (b nv dv) - they use layer 19 of cosmos predict, at first denoising step. that's all
+        context_mask = None,
+        time = None,                    # () | (b) | (b n)
+        time_video_denoise = None,      # override default logit normal sampling for video denoising time
+        noise_latents = None,           # (b na d) - for flow steering
+        predict_num_future_latents = 0,
+        prompts: list[str] | None = None,
+        prompt_token_ids = None,
+        detach_video_hiddens = False,
+        no_grad_video_model_forward = False,
+        cache = None,
+        return_cache = False,
+        return_flow = False,
+        return_embed_only = False
+    ):
+        is_flow_model = self.is_flow_model
+
+        if not is_flow_model:
+            assert exists(actions), 'actions must be given (queries for actor, actual actions for critic)'
+
+        assert not exists(self.video_predict_wrapper) or (exists(prompts) ^ exists(prompt_token_ids))
+        assert actions.shape[-2:] == self.action_shape
+
+        if exists(self.action_normalizer):
+            actions = self.action_normalizer.normalize(actions)
+
+        batch, device = actions.shape[0], actions.device
+        orig_actions = actions
+
+        is_training = not exists(time) and not return_flow
+
+        # handle multi-view
+
+        has_multi_view = exists(video) and video.ndim == 6
+        num_views = video.shape[1] if has_multi_view else 1
+
+        if has_multi_view:
+            assert num_views == self.num_video_viewpoints
+
+            video = rearrange(video, 'b v ... -> (b v) ...')
+
+            if exists(prompts):
+                if isinstance(prompts, str):
+                    prompts = [prompts] * (batch * num_views)
+                else:
+                    prompts = [p for p in prompts for _ in range(num_views)]
+
+            if exists(time_video_denoise):
+                assert time_video_denoise.shape[0] == batch
+
+        if not exists(time_video_denoise):
+            if is_training:
+                time_video_denoise = logit_normal_sample(self.video_time_denoise_mu, self.video_time_denoise_sigma, batch, device = self.device)
+            else:
+                time_video_denoise = cast_tensor(0., device = self.device)
+
+            if time_video_denoise.ndim == 0:
+                time_video_denoise = rearrange(time_video_denoise, '-> 1')
+
+            if time_video_denoise.shape[0] != batch:
+                time_video_denoise = repeat(time_video_denoise, '1 -> b', b = batch)
+
+        if not exists(cache):
+            # handle maybe extraction of video hiddens
+            # only if cache is not given
+
+            assert exists(video) ^ exists(video_hiddens)
+
+            if not exists(video_hiddens):
+                assert exists(self.video_predict_wrapper), f'`video_predict_wrapper` must be passed in if raw video is passed into MimicVideo'
+
+                video_forward_wrap = eval_no_grad if no_grad_video_model_forward else identity
+
+                video_timestep = time_video_denoise
+                if has_multi_view:
+                    video_timestep = repeat(time_video_denoise, 'b -> (b v)', v = num_views)
+
+                video_hiddens = video_forward_wrap(self.video_predict_wrapper)(
+                    video,
+                    prompts = prompts,
+                    prompt_token_ids = prompt_token_ids,
+                    timestep = video_timestep,
+                    predict_num_future_latents = predict_num_future_latents
+                )
+
+                video_hiddens = tree_map_tensor(lambda t: t.to(self.device).float(), video_hiddens) # maybe bfloat to float32
+
+                video_hiddens = tree_map_tensor(lambda t: pack_with_inverse(t, 'b * d')[0], video_hiddens)
+
+                if has_multi_view and exists(self.view_emb):
+
+                    def process_multi_view(t):
+                        t = rearrange(t, '(b v) n d -> b v n d', v = num_views)
+
+                        # add view embeddings
+
+                        t = einx.add('b v n d, v d -> b v n d', t, self.view_emb)
+
+                        # cross attend to all video hiddens across views - todo: make it an option to do cross attention layer per view
+
+                        return rearrange(t, 'b v n d -> b (v n) d')
+
+                    video_hiddens = tree_map_tensor(process_multi_view, video_hiddens)
+
+            # handle video hiddens
+
+            if detach_video_hiddens:
+                video_hiddens = video_hiddens.detach()
+
+            if not isinstance(video_hiddens, list):
+                video_hiddens = [video_hiddens]
+
+        # handle caching
+
+        prev_self_kv, prev_gru_hidden, prev_seq_len, cached_video_hiddens = cache if exists(cache) else ((None,) * self.depth, None, 0, None)
+
+        if exists(cached_video_hiddens):
+            video_hiddens = cached_video_hiddens
+
+        next_cached_self_attn_kv = []
+
+        # handle flow time conditioning
+
+        if is_training and is_flow_model:
+            time = torch.rand((batch,), device = device)
+            time = self.sample_time_fn(time)
+
+            if not exists(noise_latents):
+                noise_latents = torch.randn_like(actions)
+
+            flow = actions - noise_latents
+
+            actions, left_aligned_time = align_dims_left((actions, time))
+
+            noised = noise_latents.lerp(actions, left_aligned_time)
+
+        else:
+            noised = actions
+
+        # time may not be present for actor / critic using this backbone
+
+        if exists(time):
+
+            # save the action time condition
+
+            action_time = time
+
+            if action_time.ndim == 0:
+                action_time = repeat(action_time, ' -> b ', b = batch)
+
+            # maybe train time rtc
+
+            action_loss_mask = None
+
+            if is_training and self.train_time_rtc:
+
+                rand_prefix_len = torch.randint(0, self.train_time_rtc_max_delay, (batch,), device = device)
+                action_prefix_mask = lens_to_mask(rand_prefix_len, self.action_chunk_len)
+
+                actions = einx.where('b na, b na d, b na d', action_prefix_mask, orig_actions, actions)
+                time = einx.where('b na, , b', action_prefix_mask, 1., time)
+
+                action_loss_mask = ~action_prefix_mask
+
+            if time.ndim == 0:
+                time = repeat(time, '-> b', b = batch)
+
+            if time.ndim == 2:
+                time_video_denoise = repeat(time_video_denoise, 'b -> b n', n = time.shape[-1])
+
+            times = stack((time, time_video_denoise), dim = -1)
+
+        # embed
+
+        tokens = self.to_action_tokens(noised)
+
+        # setup empty tokens for various packed condition tokens
+
+        empty_token = tokens[:, 0:0]
+
+        # one layer of rnn for actions
+
+        rnn_out, gru_hidden = self.rnn(tokens, prev_gru_hidden)
+        tokens = rnn_out + tokens
+
+        #  mask joint state token for proprioception masking training
+
+        if exists(self.joint_normalizer):
+            joint_state = self.joint_normalizer.normalize(joint_state)
+
+        joint_state_token = self.to_joint_state_token(joint_state)
+
+        if self.training and self.has_proprio_masking:
+            mask = torch.rand((batch,), device = device) < self.proprio_mask_prob
+
+            joint_state_token = einx.where('b, d, b d', mask, self.proprio_mask_token, joint_state_token)
+
+        # setup task
+
+        task_embed = empty_token
+
+        if exists(task_ids):
+            assert exists(self.task_embed)
+            task_embed = self.task_embed(task_ids)
+
+        # setup maybe advantage
+
+        advantage_embed = empty_token
+
+        if exists(advantage_ids):
+            assert exists(self.advantage_embed)
+
+            advantage_ids = advantage_ids + 1 # 0 for dropout
+
+            dropout_advantage_ids = default(dropout_advantage_ids, self.training)
+
+            if dropout_advantage_ids:
+                cfg_dropout = torch.rand_like(advantage_ids.float()) < self.advantage_cfg_dropout
+
+                advantage_ids = einx.where('b, , b', cfg_dropout, 0, advantage_ids)
+
+            advantage_embed = self.advantage_embed(advantage_ids)
+
+        # determine time - need to handle the sequence dimension given train time RTC and various conditioning tokens
+
+        time_cond = None
+
+        if exists(time):
+            if times.ndim == 3:
+                joint_task_advantage_times = 1 + int(exists(advantage_ids)) + int(exists(task_ids))
+
+                times = pad_at_dim(times, (joint_task_advantage_times, 0), dim = 1, value = 1.) # handle joint state token on the action
+
+            # fourier embed and mlp to time condition
+
+            if is_flow_model:
+                fourier_embed = self.to_fourier_embed(times)
+
+                fourier_embed = rearrange(fourier_embed, '... times d -> ... (times d)')
+
+                time_cond = self.to_time_cond(fourier_embed)
+
+        # pack with action tokens for attention tower
+
+        tokens, inverse_pack = pack_with_inverse((advantage_embed, task_embed, joint_state_token, tokens), 'b * d')
+
+        # transformer layers
+
+        layer_outputs = [tokens]
+
+        for ((
+            cross_attn_agg,
+            cross_attn_norm,
+            cross_attn,
+            attn_agg,
+            attn_norm,
+            attn,
+            ff_agg,
+            ff_norm,
+            ff
+        ), layer_video_hidden_index, cached_self_kv) in zip(self.layers, self.extracted_video_layer_indices, prev_self_kv):
+
+            # cross attention
+
+            tokens = cross_attn_agg(layer_outputs)
+
+            branch_tokens, gate = cross_attn_norm(tokens, time_cond)
+
+            layer_video_hidden = None
+
+            if exists(video_hiddens):
+                layer_video_hidden = video_hiddens[layer_video_hidden_index]
+
+            cross_attn_out = cross_attn(branch_tokens, context = layer_video_hidden, context_mask = context_mask)
+
+            layer_outputs.append(cross_attn_out * gate)
+
+            # self attention
+
+            tokens = attn_agg(layer_outputs)
+
+            branch_tokens, gate = attn_norm(tokens, time_cond)
+
+            attn_out, self_kv = attn(branch_tokens, kv = cached_self_kv, return_kv = True)
+
+            layer_outputs.append(attn_out * gate)
+
+            if return_cache:
+                next_cached_self_attn_kv.append(self_kv)
+
+            # prepare feedforward
+
+            tokens = ff_agg(layer_outputs)
+
+            branch_tokens, gate = ff_norm(tokens, time_cond)
+
+            # shift along time for action tokens for cheap relative positioning, which is better than messing with rope with such short action chunks
+
+            *non_action_tokens, branch_tokens = inverse_pack(branch_tokens)
+
+            branch_tokens = shift_feature_dim(branch_tokens)
+
+            branch_tokens, _ = pack_with_inverse((*non_action_tokens, branch_tokens), 'b * d')
+
+            # feedforward
+
+            layer_outputs.append(ff(branch_tokens) * gate)
+
+        # final attention aggregation
+
+        tokens = self.final_attn_agg(layer_outputs)
+
+        # remove joint token
+
+        *_, tokens = inverse_pack(tokens)
+
+        # embed
+
+        embed = self.final_norm(tokens)
+
+        if return_embed_only:
+            return embed
+
+        # prediction
+
+        pred = self.to_pred(embed)
+
+        # if being used for actor / critic, then just return the prediction
+
+        if not is_flow_model:
+            return pred
+
+        # convert to flow if outputting in x0 space
+
+        if self.model_output_clean:
+            pred_flow = (pred - noised) / pad_right_ndim_to(1. - action_time, pred.ndim).clamp_min(self.eps)
+        else:
+            pred_flow = pred
+
+        # handle maybe loss or returning flow for inference
+
+        if not is_training:
+            # flow
+
+            out = pred_flow
+        else:
+            # mse flow loss
+
+            flow_loss = F.mse_loss(pred_flow, flow, reduction = 'none')
+
+            loss = masked_mean(flow_loss, action_loss_mask)
+
+            if exists(self.state_autoencoder):
+                loss = loss + self.state_autoencoder(video_hiddens[self.state_autoencoder_video_layer_index]) * self.state_autoencoder_loss_weight
+
+            out = loss
+
+        if not return_cache:
+            return out
+
+        # handle returning of cache
+
+        return out, Cache(next_cached_self_attn_kv, gru_hidden, prev_seq_len + noised.shape[1], video_hiddens)
